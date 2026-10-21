@@ -1,0 +1,179 @@
+--- a/source/Plain Craft Launcher 2/Modules/ModMain.vb
++++ b/source/Plain Craft Launcher 2/Modules/ModMain.vb
+@@ -168,6 +168,10 @@
+         ''' </summary>
+         Public Content As Object
+         ''' <summary>
++        ''' 登录模式：发起本次设备授权的加载器线程，用于跨线程检查取消和会话重启。
++        ''' </summary>
++        Public LoginThread As Thread
++        ''' <summary>
+         ''' 输入模式：输入验证规则。
+         ''' </summary>
+         Public ValidateRules As Collection(Of Validate)
+--- a/source/Plain Craft Launcher 2/Modules/Minecraft/ModLaunch.vb
++++ b/source/Plain Craft Launcher 2/Modules/Minecraft/ModLaunch.vb
+@@ -902,7 +902,7 @@
+         McLaunchLog("网页登录地址：" & PrepareJson("verification_uri").ToString)
+ 
+         '弹窗
++        Dim Converter As New MyMsgBoxConverter With {.Content = PrepareJson, .ForceWait = True, .Type = MyMsgBoxType.Login, .LoginThread = Thread.CurrentThread}
+-        Dim Converter As New MyMsgBoxConverter With {.Content = PrepareJson, .ForceWait = True, .Type = MyMsgBoxType.Login}
+         WaitingMyMsgBox.Enqueue(Converter)
+         While Converter.Result Is Nothing
+             Thread.Sleep(100)
+--- a/source/Plain Craft Launcher 2/Pages/PageLaunch/MyMsgLogin.xaml.vb
++++ b/source/Plain Craft Launcher 2/Pages/PageLaunch/MyMsgLogin.xaml.vb
+@@ -10,132 +10,134 @@
+ #Region "弹窗"
+ 
+     Private ReadOnly MyConverter As MyMsgBoxConverter
++    Private ReadOnly LoginThread As Thread
+     Private ReadOnly Uuid As Integer = GetUuid()
+ 
+     Public Sub New(Converter As MyMsgBoxConverter)
+         MyConverter = Converter
++        LoginThread = Converter.LoginThread
+         Try
+             InitializeComponent()
+             Btn1.Name = Btn1.Name & GetUuid()
+             Btn2.Name = Btn2.Name & GetUuid()
+             Btn3.Name = Btn3.Name & GetUuid()
+             ShapeLine.StrokeThickness = GetWPFSize(1)
+             Data = Converter.Content
+             Init()
+         Catch ex As Exception
+             Logger.Warn("Microsoft 登录窗口初始化失败：" & ex.GetType().Name)
+             Finished(New Exception("$Microsoft 登录窗口初始化失败，请重新登录。"))
+         End Try
+     End Sub
+ 
+     Private Sub Load(sender As Object, e As EventArgs) Handles MyBase.Loaded
+         Try
+             '动画
+             Opacity = 0
+             AniStart(AaColor(FrmMain.PanMsg, Grid.BackgroundProperty, If(MyConverter.IsWarn, New MyColor(140, 80, 0, 0), New MyColor(90, 0, 0, 0)) - FrmMain.PanMsg.Background, 200), "PanMsg Background")
+             AniStart({
+                 AaOpacity(Me, 1, 120, 60),
+                 AaDouble(Sub(i) TransformPos.Y += i, -TransformPos.Y, 300, 60, New AniEaseOutBack(AniEasePower.Weak)),
+                 AaDouble(Sub(i) TransformRotate.Angle += i, -TransformRotate.Angle, 300, 60, New AniEaseOutFluent(AniEasePower.Weak))
+             }, "MyMsgBox " & Uuid)
+             '记录日志
+             Logger.Info($"登录弹窗：{LabTitle.Text}{vbCrLf}{LabCaption.Text}")
+         Catch ex As Exception
+             Logger.Error(ex, "登录弹窗加载失败", LogBehavior.Toast)
+         End Try
+     End Sub
+     Private Sub Close()
+         '动画
+         AniStart({
+             AaCode(
+             Sub()
+                 If Not WaitingMyMsgBox.Any() Then
+                     AniStart(AaColor(FrmMain.PanMsg, Grid.BackgroundProperty, New MyColor(0, 0, 0, 0) - FrmMain.PanMsg.Background, 200, Ease:=New AniEaseOutFluent(AniEasePower.Weak)))
+                 End If
+             End Sub, 30),
+             AaOpacity(Me, -Opacity, 80, 20),
+             AaDouble(Sub(i) TransformPos.Y += i, 20 - TransformPos.Y, 150, 0, New AniEaseOutFluent),
+             AaDouble(Sub(i) TransformRotate.Angle += i, 6 - TransformRotate.Angle, 150, 0, New AniEaseInFluent(AniEasePower.Weak)),
+             AaCode(Sub() CType(Parent, Grid).Children.Remove(Me), , True)
+         }, "MyMsgBox " & Uuid)
+     End Sub
+ 
+     '实现回车和 Esc 的接口（#4857）
+     Public Sub Btn1_Click() Handles Btn1.Click
+     End Sub
+     Public Sub Btn3_Click() Handles Btn3.Click
+         Finished(New OperationCanceledException)
+     End Sub
+ 
+     Private Sub Drag(sender As Object, e As MouseButtonEventArgs) Handles PanBorder.MouseLeftButtonDown, LabTitle.MouseLeftButtonDown
+         On Error Resume Next
+         If e.GetPosition(ShapeLine).Y <= 2 Then FrmMain.DragMove()
+     End Sub
+ 
+ #End Region
+ 
+     Private Sub Finished(Result As Object)
+         If Interlocked.Exchange(Completed, 1) <> 0 Then Return
+         MyConverter.IsExited = True
+         MyConverter.Result = Result
+         RunInUi(AddressOf Close)
+         Thread.Sleep(200)
+         FrmMain.ShowWindowToTop()
+     End Sub
+ 
+     Private Sub Init()
+         LoginClientId = MicrosoftOAuthPolicy.NormalizeClientId(CStr(Data("pcl_client_id")))
+         UserCode = Data("user_code")
+         DeviceCode = Data("device_code")
+         Website = Data("verification_uri")
+         '设置 UI
+         LabTitle.Text = "登录 Minecraft"
+         LabCaption.Text =
+             $"登录网页将自动开启，请在网页中输入 {UserCode}（已自动复制）。" & vbCrLf & vbCrLf &
+             $"如果网络环境不佳，网页可能一直加载不出来，届时请使用加速器或 VPN 改善网络环境。" & vbCrLf &
+             $"你也可以用其他设备打开 {Website} 并输入上述代码。"
+         CustomEventService.SetEventData(Btn1, Website)
+         CustomEventService.SetEventData(Btn2, UserCode)
+         '启动工作线程
+         RunInNewThread(AddressOf WorkThread, "MyMsgLogin")
+     End Sub
+ 
+     Private Function WaitBeforePoll(Seconds As Integer, Expires As Integer) As Boolean
+         Dim EndAt = Clock.Elapsed.TotalSeconds + Seconds
+         Do
+             If MyConverter.IsExited Then Return False
++            If McLoginMsLoader.IsCanceledWithThread(LoginThread) Then
+-            If McLoginMsLoader.IsCanceled Then
+                 Finished(New OperationCanceledException()) : Return False
+             End If
+             If Clock.Elapsed.TotalSeconds >= Expires Then
+                 Finished(New Exception("$Microsoft 登录验证码已过期，请重新登录。")) : Return False
+             End If
+             If Clock.Elapsed.TotalSeconds >= EndAt Then Return True
+             Thread.Sleep(100)
+         Loop
+     End Function
+     Private Sub WorkThread()
+         Dim Interval = MicrosoftOAuthPolicy.PollInterval(If(Data("interval")?.Value(Of Integer)(), 5))
+         Dim Expires = If(Data("expires_in")?.Value(Of Integer)(), 900)
+         Dim Failures As Integer = 0
+         Try
+             OpenWebsite(Website)
+             ClipboardSet(UserCode)
+         Catch ex As Exception
+             Hint("请手动打开登录网页并输入窗口中的验证码。")
+         End Try
+         While WaitBeforePoll(Interval, Expires)
+             Try
+                 Dim Reply = NetRequestByClient(MicrosoftOAuthPolicy.TokenEndpoint, HttpMethod.Post,
+                     Content:=MicrosoftOAuthPolicy.PollRequest(LoginClientId, DeviceCode),
+                     ContentType:="application/x-www-form-urlencoded", Timeout:=15000,
+                     MakeLog:=False, RequireJson:=True).DeserializeJson(Of JObject)()
+                 Dim Access = CStr(Reply("access_token")), Refresh = CStr(Reply("refresh_token"))
+                 If String.IsNullOrEmpty(Access) OrElse String.IsNullOrEmpty(Refresh) Then Throw New InvalidDataException("令牌响应缺少必要字段")
++                If MyConverter.IsExited OrElse McLoginMsLoader.IsCanceledWithThread(LoginThread) Then
+-                If MyConverter.IsExited OrElse McLoginMsLoader.IsCanceled Then
+                     Finished(New OperationCanceledException()) : Return
+                 End If
++                Hint("Microsoft 授权成功，正在验证 Minecraft 账号……")
+-                Hint("网页登录成功！", HintType.Green)
+                 Finished({Access, Refresh}) : Return
+             Catch ex As HttpRequestCodeException
+                 Select Case MicrosoftOAuthError(ex.Response)
+--- a/source/Plain Craft Launcher 2/Pages/PageLaunch/PageLoginMs.xaml.vb
++++ b/source/Plain Craft Launcher 2/Pages/PageLaunch/PageLoginMs.xaml.vb
+@@ -82,7 +82,11 @@
+                     Thread.Sleep(50)
+                 Loop
+                 If McLoginMsLoader.State = LoadState.Finished Then
++                    RunInUi(
++                    Sub()
++                        FrmLaunchLeft.RefreshPage(False, True)
++                        Hint("正版账号登录成功！", HintType.Green)
++                    End Sub)
+-                    RunInUi(Sub() FrmLaunchLeft.RefreshPage(False, True))
+                 ElseIf McLoginMsLoader.State = LoadState.Canceled Then
+                     Throw New OperationCanceledException
+                 ElseIf McLoginMsLoader.Error Is Nothing Then
